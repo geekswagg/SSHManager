@@ -14,6 +14,7 @@ class Program
         var commentOption = new Option<string>("--comment", description: "OpenSSH public key comment", getDefaultValue: () => "AzureDevOps");
         var passOption = new Option<string>("--passphrase", description: "If provided, also export encrypted PKCS#8 with this passphrase", getDefaultValue: () => string.Empty);
         var clipboardOption = new Option<bool>("--clipboard", description: "Copy the public key to clipboard", getDefaultValue: () => true);
+        var configOption = new Option<bool>("--config", description: "Generate SSH config file entry for Azure DevOps", getDefaultValue: () => true);
 
         var root = new RootCommand("Generate an RSA keypair for Azure DevOps (OpenSSH public key + PEM private key)");
         root.AddOption(nameOption);
@@ -21,8 +22,9 @@ class Program
         root.AddOption(commentOption);
         root.AddOption(passOption);
         root.AddOption(clipboardOption);
+        root.AddOption(configOption);
 
-        root.SetHandler(async (string name, string outDir, string comment, string passphrase, bool copyToClipboard) =>
+        root.SetHandler(async (string name, string outDir, string comment, string passphrase, bool copyToClipboard, bool generateConfig) =>
         {
             // Create a nice header
             AnsiConsole.Write(
@@ -37,8 +39,10 @@ class Program
             Directory.CreateDirectory(outDir);
             var privPath = Path.Combine(outDir, name);
             var pubPath = Path.Combine(outDir, name + ".pub");
+            var configPath = Path.Combine(outDir, "config");
 
             string sshPub = "";
+            bool configFileUpdated = false;
 
             // Show progress
             await AnsiConsole.Status()
@@ -75,6 +79,13 @@ class Program
                     sshPub = BuildOpenSshRsaPublicKey(rsa, comment);
                     File.WriteAllText(pubPath, sshPub);
 
+                    // Generate SSH config file entry
+                    if (generateConfig)
+                    {
+                        ctx.Status("Updating SSH config file...");
+                        configFileUpdated = await UpdateSshConfigFile(configPath, name, outDir);
+                    }
+
                     // Copy to clipboard if requested
                     if (copyToClipboard)
                     {
@@ -108,8 +119,19 @@ class Program
             
             table.AddRow("[cyan]Public Key[/]", $"[dim]{pubPath}[/]", "OpenSSH format for Azure DevOps");
 
+            if (generateConfig && configFileUpdated)
+            {
+                table.AddRow("[magenta]SSH Config[/]", $"[dim]{configPath}[/]", "SSH configuration for Azure DevOps");
+            }
+
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine("[bold green]✓ SSH Key pair generated successfully![/]");
+            
+            if (generateConfig && configFileUpdated)
+            {
+                AnsiConsole.MarkupLine("[bold green]✓ SSH config file updated with Azure DevOps entry![/]");
+            }
+            
             AnsiConsole.WriteLine();
             AnsiConsole.Write(table);
 
@@ -153,14 +175,22 @@ class Program
 
             // Show next steps with nice formatting
             AnsiConsole.WriteLine();
-            var stepsPanel = new Panel(
-                new Markup(
-                    "[bold yellow]1.[/] Go to Azure DevOps → User Settings → SSH Public Keys\n" +
-                    "[bold yellow]2.[/] Click 'Add' and paste the public key " + 
-                    (copyToClipboard ? "(already in clipboard)" : "content above") + "\n" +
-                    "[bold yellow]3.[/] Configure your SSH client to use the private key\n" +
-                    "[bold yellow]4.[/] Test the connection: [dim]ssh -T git@ssh.dev.azure.com[/]"
-                ))
+            var nextStepsText = "[bold yellow]1.[/] Go to Azure DevOps → User Settings → SSH Public Keys\n" +
+                               "[bold yellow]2.[/] Click 'Add' and paste the public key " + 
+                               (copyToClipboard ? "(already in clipboard)" : "content above") + "\n";
+
+            if (generateConfig && configFileUpdated)
+            {
+                nextStepsText += "[bold yellow]3.[/] SSH is now configured! You can clone repos with: [dim]git clone git@dev.azure.com:org/repo.git[/]\n" +
+                               "[bold yellow]4.[/] Test the connection: [dim]ssh -T git@ssh.dev.azure.com[/]";
+            }
+            else
+            {
+                nextStepsText += "[bold yellow]3.[/] Configure your SSH client to use the private key\n" +
+                               "[bold yellow]4.[/] Test the connection: [dim]ssh -T git@ssh.dev.azure.com[/]";
+            }
+
+            var stepsPanel = new Panel(new Markup(nextStepsText))
                 .Header("[bold green]Next Steps[/]")
                 .Border(BoxBorder.Rounded)
                 .BorderColor(Color.Green);
@@ -170,9 +200,82 @@ class Program
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine("[bold blue]Happy coding! 🚀[/]");
 
-        }, nameOption, outDirOption, commentOption, passOption, clipboardOption);
+        }, nameOption, outDirOption, commentOption, passOption, clipboardOption, configOption);
 
         return root.Invoke(args);
+    }
+
+    // Update SSH config file with Azure DevOps entry
+    static async Task<bool> UpdateSshConfigFile(string configPath, string keyName, string sshDir)
+    {
+        try
+        {
+            var identityFilePath = Path.Combine(sshDir, keyName).Replace('\\', '/');
+            var configEntry = $@"
+# Azure DevOps SSH Configuration (Generated by SSH Key Generator)
+Host dev.azure.com
+  HostName ssh.dev.azure.com
+  User git
+  IdentityFile {identityFilePath}
+  IdentitiesOnly yes
+
+";
+
+            var configExists = File.Exists(configPath);
+            var existingContent = configExists ? await File.ReadAllTextAsync(configPath) : "";
+
+            // Check if Azure DevOps config already exists
+            if (existingContent.Contains("Host dev.azure.com"))
+            {
+                // Replace existing Azure DevOps configuration
+                var lines = existingContent.Split('\n');
+                var newLines = new List<string>();
+                bool inAzureDevOpsSection = false;
+                bool foundSection = false;
+
+                foreach (var line in lines)
+                {
+                    if (line.Trim().StartsWith("Host dev.azure.com"))
+                    {
+                        inAzureDevOpsSection = true;
+                        foundSection = true;
+                        // Add our new configuration
+                        newLines.Add(configEntry.TrimEnd());
+                        continue;
+                    }
+                    
+                    if (inAzureDevOpsSection && line.Trim().StartsWith("Host ") && !line.Trim().StartsWith("Host dev.azure.com"))
+                    {
+                        inAzureDevOpsSection = false;
+                    }
+
+                    if (!inAzureDevOpsSection)
+                    {
+                        newLines.Add(line);
+                    }
+                }
+
+                await File.WriteAllTextAsync(configPath, string.Join('\n', newLines));
+            }
+            else
+            {
+                // Append new configuration
+                var content = existingContent;
+                if (!string.IsNullOrEmpty(content) && !content.EndsWith('\n'))
+                {
+                    content += '\n';
+                }
+                content += configEntry;
+                await File.WriteAllTextAsync(configPath, content);
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[yellow]Warning: Could not update SSH config file: {ex.Message}[/]");
+            return false;
+        }
     }
 
     // Build OpenSSH public key string: "ssh-rsa <base64(payload)> <comment>"
