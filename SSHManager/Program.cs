@@ -3,23 +3,26 @@ using System.Security.Cryptography;
 using System.Text;
 using System.CommandLine;
 using Spectre.Console;
+using TextCopy;
 
 class Program
 {
     static int Main(string[] args)
     {
         var nameOption = new Option<string>("--name", description: "Base filename (no extension)", getDefaultValue: () => "id_rsa_ado");
-        var outDirOption = new Option<string>("--out", description: "Output directory", getDefaultValue: () => Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) + "\\Downloads");
+        var outDirOption = new Option<string>("--out", description: "Output directory", getDefaultValue: () => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ssh"));
         var commentOption = new Option<string>("--comment", description: "OpenSSH public key comment", getDefaultValue: () => "AzureDevOps");
         var passOption = new Option<string>("--passphrase", description: "If provided, also export encrypted PKCS#8 with this passphrase", getDefaultValue: () => string.Empty);
+        var clipboardOption = new Option<bool>("--clipboard", description: "Copy the public key to clipboard", getDefaultValue: () => true);
 
         var root = new RootCommand("Generate an RSA keypair for Azure DevOps (OpenSSH public key + PEM private key)");
         root.AddOption(nameOption);
         root.AddOption(outDirOption);
         root.AddOption(commentOption);
         root.AddOption(passOption);
+        root.AddOption(clipboardOption);
 
-        root.SetHandler((string name, string outDir, string comment, string passphrase) =>
+        root.SetHandler(async (string name, string outDir, string comment, string passphrase, bool copyToClipboard) =>
         {
             // Create a nice header
             AnsiConsole.Write(
@@ -35,9 +38,11 @@ class Program
             var privPath = Path.Combine(outDir, name);
             var pubPath = Path.Combine(outDir, name + ".pub");
 
+            string sshPub = "";
+
             // Show progress
-            AnsiConsole.Status()
-                .Start("Generating RSA key pair...", ctx =>
+            await AnsiConsole.Status()
+                .StartAsync("Generating RSA key pair...", async ctx =>
                 {
                     ctx.Status("Creating 4096-bit RSA key...");
                     ctx.Spinner(Spinner.Known.Star);
@@ -67,8 +72,23 @@ class Program
 
                     ctx.Status("Generating OpenSSH public key...");
                     // ----- PUBLIC KEY (OpenSSH "ssh-rsa AAAA... comment") -----
-                    var sshPub = BuildOpenSshRsaPublicKey(rsa, comment);
+                    sshPub = BuildOpenSshRsaPublicKey(rsa, comment);
                     File.WriteAllText(pubPath, sshPub);
+
+                    // Copy to clipboard if requested
+                    if (copyToClipboard)
+                    {
+                        ctx.Status("Copying public key to clipboard...");
+                        try
+                        {
+                            await ClipboardService.SetTextAsync(sshPub.TrimEnd());
+                        }
+                        catch (Exception ex)
+                        {
+                            // Clipboard might not be available in some environments
+                            AnsiConsole.MarkupLine($"[yellow]Warning: Could not copy to clipboard: {ex.Message}[/]");
+                        }
+                    }
 
                     ctx.Status("Complete!");
                 });
@@ -93,23 +113,51 @@ class Program
             AnsiConsole.WriteLine();
             AnsiConsole.Write(table);
 
+            // Display clipboard status
+            if (copyToClipboard)
+            {
+                AnsiConsole.WriteLine();
+                AnsiConsole.MarkupLine("[bold green]📋 Public key copied to clipboard![/]");
+            }
+
             // Display the public key content
-            var publicKeyContent = File.ReadAllText(pubPath).TrimEnd();
+            var publicKeyContent = sshPub.TrimEnd();
             
             AnsiConsole.WriteLine();
             var publicKeyPanel = new Panel(new Markup($"[dim]{publicKeyContent}[/]"))
-                .Header("[bold cyan]Public Key Content (copy this to Azure DevOps)[/]")
+                .Header(copyToClipboard ? 
+                    "[bold cyan]Public Key Content (already copied to clipboard)[/]" : 
+                    "[bold cyan]Public Key Content (copy this to Azure DevOps)[/]")
                 .Border(BoxBorder.Rounded)
                 .BorderColor(Color.Blue);
             
             AnsiConsole.Write(publicKeyPanel);
+
+            // Show manual copy option if clipboard wasn't used
+            if (!copyToClipboard)
+            {
+                AnsiConsole.WriteLine();
+                if (AnsiConsole.Confirm("[bold yellow]Would you like to copy the public key to clipboard now?[/]"))
+                {
+                    try
+                    {
+                        await ClipboardService.SetTextAsync(publicKeyContent);
+                        AnsiConsole.MarkupLine("[bold green]📋 Public key copied to clipboard![/]");
+                    }
+                    catch (Exception ex)
+                    {
+                        AnsiConsole.MarkupLine($"[red]Error copying to clipboard: {ex.Message}[/]");
+                    }
+                }
+            }
 
             // Show next steps with nice formatting
             AnsiConsole.WriteLine();
             var stepsPanel = new Panel(
                 new Markup(
                     "[bold yellow]1.[/] Go to Azure DevOps → User Settings → SSH Public Keys\n" +
-                    "[bold yellow]2.[/] Click 'Add' and paste the public key content above\n" +
+                    "[bold yellow]2.[/] Click 'Add' and paste the public key " + 
+                    (copyToClipboard ? "(already in clipboard)" : "content above") + "\n" +
                     "[bold yellow]3.[/] Configure your SSH client to use the private key\n" +
                     "[bold yellow]4.[/] Test the connection: [dim]ssh -T git@ssh.dev.azure.com[/]"
                 ))
@@ -122,7 +170,7 @@ class Program
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine("[bold blue]Happy coding! 🚀[/]");
 
-        }, nameOption, outDirOption, commentOption, passOption);
+        }, nameOption, outDirOption, commentOption, passOption, clipboardOption);
 
         return root.Invoke(args);
     }
