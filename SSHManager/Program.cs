@@ -1,14 +1,15 @@
 ﻿using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
-using System.CommandLine; // <-- Add this using directive
+using System.CommandLine;
+using Spectre.Console;
 
 class Program
 {
     static int Main(string[] args)
     {
         var nameOption = new Option<string>("--name", description: "Base filename (no extension)", getDefaultValue: () => "id_rsa_ado");
-        var outDirOption = new Option<string>("--out", description: "Output directory", getDefaultValue: () => Directory.GetCurrentDirectory());
+        var outDirOption = new Option<string>("--out", description: "Output directory", getDefaultValue: () => Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) + "\\Downloads");
         var commentOption = new Option<string>("--comment", description: "OpenSSH public key comment", getDefaultValue: () => "AzureDevOps");
         var passOption = new Option<string>("--passphrase", description: "If provided, also export encrypted PKCS#8 with this passphrase", getDefaultValue: () => string.Empty);
 
@@ -20,44 +21,107 @@ class Program
 
         root.SetHandler((string name, string outDir, string comment, string passphrase) =>
         {
+            // Create a nice header
+            AnsiConsole.Write(
+                new FigletText("SSH Key Generator")
+                    .LeftJustified()
+                    .Color(Color.Blue));
+
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[bold yellow]Generating RSA keypair for Azure DevOps...[/]");
+            AnsiConsole.WriteLine();
+
             Directory.CreateDirectory(outDir);
             var privPath = Path.Combine(outDir, name);
             var pubPath = Path.Combine(outDir, name + ".pub");
 
-            using var rsa = RSA.Create(4096);
+            // Show progress
+            AnsiConsole.Status()
+                .Start("Generating RSA key pair...", ctx =>
+                {
+                    ctx.Status("Creating 4096-bit RSA key...");
+                    ctx.Spinner(Spinner.Known.Star);
+                    ctx.SpinnerStyle(Style.Parse("green"));
 
-            // ----- PRIVATE KEY (PKCS#1 PEM: "BEGIN RSA PRIVATE KEY") -----
-            var pkcs1 = rsa.ExportRSAPrivateKey(); // PKCS#1
-            var pkcs1Pem = PemEncode("RSA PRIVATE KEY", pkcs1);
-            File.WriteAllText(privPath, pkcs1Pem);
-            // Lock down permissions if on *nix; on Windows rely on NTFS defaults.
+                    using var rsa = RSA.Create(4096);
 
-            // ----- OPTIONAL ENCRYPTED PKCS#8 -----
+                    ctx.Status("Exporting private key (PKCS#1)...");
+                    // ----- PRIVATE KEY (PKCS#1 PEM: "BEGIN RSA PRIVATE KEY") -----
+                    var pkcs1 = rsa.ExportRSAPrivateKey(); // PKCS#1
+                    var pkcs1Pem = PemEncode("RSA PRIVATE KEY", pkcs1);
+                    File.WriteAllText(privPath, pkcs1Pem);
+
+                    // ----- OPTIONAL ENCRYPTED PKCS#8 -----
+                    string? pkcs8Path = null;
+                    if (!string.IsNullOrEmpty(passphrase))
+                    {
+                        ctx.Status("Exporting encrypted private key (PKCS#8)...");
+                        var pkcs8Encrypted = rsa.ExportEncryptedPkcs8PrivateKey(
+                            password: passphrase.AsSpan(),
+                            pbeParameters: new PbeParameters(PbeEncryptionAlgorithm.Aes256Cbc, HashAlgorithmName.SHA256, iterationCount: 100_000)
+                        );
+                        pkcs8Path = Path.Combine(outDir, name + ".pkcs8.enc.pem");
+                        var pkcs8Pem = PemEncode("ENCRYPTED PRIVATE KEY", pkcs8Encrypted);
+                        File.WriteAllText(pkcs8Path, pkcs8Pem);
+                    }
+
+                    ctx.Status("Generating OpenSSH public key...");
+                    // ----- PUBLIC KEY (OpenSSH "ssh-rsa AAAA... comment") -----
+                    var sshPub = BuildOpenSshRsaPublicKey(rsa, comment);
+                    File.WriteAllText(pubPath, sshPub);
+
+                    ctx.Status("Complete!");
+                });
+
+            // Create a nice results table
+            var table = new Table();
+            table.AddColumn("[bold blue]File Type[/]");
+            table.AddColumn("[bold blue]Path[/]");
+            table.AddColumn("[bold blue]Description[/]");
+
+            table.AddRow("[green]Private Key[/]", $"[dim]{privPath}[/]", "PKCS#1 format for SSH clients");
+            
             if (!string.IsNullOrEmpty(passphrase))
             {
-                var pkcs8Encrypted = rsa.ExportEncryptedPkcs8PrivateKey(
-                    password: passphrase.AsSpan(),
-                    pbeParameters: new PbeParameters(PbeEncryptionAlgorithm.Aes256Cbc, HashAlgorithmName.SHA256, iterationCount: 100_000)
-                );
-                var pkcs8Path = Path.Combine(outDir, name + ".pkcs8.enc.pem");
-                var pkcs8Pem = PemEncode("ENCRYPTED PRIVATE KEY", pkcs8Encrypted);
-                File.WriteAllText(pkcs8Path, pkcs8Pem);
+                table.AddRow("[yellow]Encrypted Private[/]", $"[dim]{Path.Combine(outDir, name + ".pkcs8.enc.pem")}[/]", "Password-protected PKCS#8 format");
             }
+            
+            table.AddRow("[cyan]Public Key[/]", $"[dim]{pubPath}[/]", "OpenSSH format for Azure DevOps");
 
-            // ----- PUBLIC KEY (OpenSSH "ssh-rsa AAAA... comment") -----
-            var sshPub = BuildOpenSshRsaPublicKey(rsa, comment);
-            File.WriteAllText(pubPath, sshPub);
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[bold green]✓ SSH Key pair generated successfully![/]");
+            AnsiConsole.WriteLine();
+            AnsiConsole.Write(table);
 
-            Console.WriteLine("Generated:");
-            Console.WriteLine($"  Private key (PKCS#1): {privPath}");
-            if (!string.IsNullOrEmpty(passphrase))
-                Console.WriteLine($"  Encrypted private key (PKCS#8): {Path.Combine(outDir, name + ".pkcs8.enc.pem")}");
-            Console.WriteLine($"  Public key (OpenSSH): {pubPath}");
-            Console.WriteLine();
-            Console.WriteLine("Next steps:");
-            Console.WriteLine("  1) Add the public key (.pub) to Azure DevOps > User Settings > SSH Public Keys.");
-            Console.WriteLine("  2) Ensure your SSH client uses the private key when talking to dev.azure.com.");
-            Console.WriteLine("  3) Test: ssh -T git@ssh.dev.azure.com");
+            // Display the public key content
+            var publicKeyContent = File.ReadAllText(pubPath).TrimEnd();
+            
+            AnsiConsole.WriteLine();
+            var publicKeyPanel = new Panel(new Markup($"[dim]{publicKeyContent}[/]"))
+                .Header("[bold cyan]Public Key Content (copy this to Azure DevOps)[/]")
+                .Border(BoxBorder.Rounded)
+                .BorderColor(Color.Blue);
+            
+            AnsiConsole.Write(publicKeyPanel);
+
+            // Show next steps with nice formatting
+            AnsiConsole.WriteLine();
+            var stepsPanel = new Panel(
+                new Markup(
+                    "[bold yellow]1.[/] Go to Azure DevOps → User Settings → SSH Public Keys\n" +
+                    "[bold yellow]2.[/] Click 'Add' and paste the public key content above\n" +
+                    "[bold yellow]3.[/] Configure your SSH client to use the private key\n" +
+                    "[bold yellow]4.[/] Test the connection: [dim]ssh -T git@ssh.dev.azure.com[/]"
+                ))
+                .Header("[bold green]Next Steps[/]")
+                .Border(BoxBorder.Rounded)
+                .BorderColor(Color.Green);
+            
+            AnsiConsole.Write(stepsPanel);
+
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[bold blue]Happy coding! 🚀[/]");
+
         }, nameOption, outDirOption, commentOption, passOption);
 
         return root.Invoke(args);
