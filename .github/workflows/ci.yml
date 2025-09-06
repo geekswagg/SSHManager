@@ -10,6 +10,9 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     
+    env:
+      CONSOLE_PROJECT_PATH: 'SSHManager/SSHManager.csproj'
+    
     steps:
     - uses: actions/checkout@v4
     
@@ -28,7 +31,7 @@ jobs:
       run: dotnet test --no-build --configuration Release --verbosity normal --collect:"XPlat Code Coverage"
       
     - name: Publish console app
-      run: dotnet publish SSHManager/SSHManager.csproj --no-build --configuration Release --output ./publish
+      run: dotnet publish ${{ env.CONSOLE_PROJECT_PATH }} --no-build --configuration Release --output ./publish
       
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
