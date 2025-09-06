@@ -7,4 +7,4 @@ This project includes a GitHub Actions workflow that automatically:
 - Runs all tests with code coverage
 - Publishes release artifacts
 
-The workflow triggers on pushes and pull requests to the `main` branch.
+The workflow triggers on pushes and pull requests to the `main`, `master`, and `development` branches.
